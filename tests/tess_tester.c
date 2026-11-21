@@ -198,11 +198,66 @@ static void test_float_variant(void) {
   TEST_CHECK(r.num_triangles == 3);
 }
 
+/* Concave L-shape: every triangle must keep the ring winding, sum to the
+ * polygon area, and produce identical ring-local triangles after any rigid
+ * translation. Regression for inverted/overlapping ears and position-
+ * dependent results. */
+static double edge_rel_area(const double *pts, uint32_t a, uint32_t b,
+                            uint32_t c) {
+  double ux = pts[3 * b] - pts[3 * a];
+  double uy = pts[3 * b + 1] - pts[3 * a + 1];
+  double vx = pts[3 * c] - pts[3 * a];
+  double vy = pts[3 * c + 1] - pts[3 * a + 1];
+  return 0.5 * (ux * vy - uy * vx);
+}
+
+static void test_concave_coverage_winding_and_translation(void) {
+  static const double base[18] = {0, 0, 0, 2, 0, 0, 2, 1, 0,
+                                  1, 1, 0, 1, 2, 0, 0, 2, 0};
+  double shifted[18];
+  for (int i = 0; i < 6; i++) {
+    shifted[3 * i] = base[3 * i] + 1.0e12;
+    shifted[3 * i + 1] = base[3 * i + 1] - 5.0e11;
+    shifted[3 * i + 2] = base[3 * i + 2];
+  }
+
+  tobj_tess_result r1 = run_d(base, 6);
+  tobj_tess_result r2 = run_d(shifted, 6);
+
+  TEST_CHECK(r1.status == TOBJ_TESS_OK);
+  TEST_CHECK(r2.status == TOBJ_TESS_OK);
+  TEST_CHECK(r1.num_triangles == 4);
+  TEST_CHECK(r2.num_triangles == 4);
+
+  double area1 = 0.0, area2 = 0.0;
+  for (uint32_t t = 0; t < 4; t++) {
+    uint32_t a = g_out[3 * t], b = g_out[3 * t + 1], c = g_out[3 * t + 2];
+    double ta = edge_rel_area(base, a, b, c);
+    TEST_CHECK_(ta > 0.0, "tri %u CCW, area %g", t, ta);
+    area1 += ta;
+  }
+  TEST_CHECK_(fabs(area1 - 3.0) < 1e-9, "coverage area %g == 3.0", area1);
+
+  /* Translation must not change the ring-local index sequence. */
+  uint32_t saved[12];
+  memcpy(saved, g_out, sizeof saved);
+  run_d(shifted, 6);
+  for (int i = 0; i < 12; i++) TEST_CHECK(g_out[i] == saved[i]);
+  for (uint32_t t = 0; t < 4; t++) {
+    area2 += edge_rel_area(shifted, g_out[3 * t], g_out[3 * t + 1],
+                           g_out[3 * t + 2]);
+  }
+  TEST_CHECK_(fabs(area2 - 3.0) < 1e-6, "shifted coverage area %g == 3.0",
+              area2);
+}
+
 TEST_LIST = {
     {"n_too_small", test_n_too_small},
     {"triangle", test_triangle},
     {"square", test_square},
     {"concave_L", test_concave_L},
+    {"concave_coverage_winding_and_translation",
+     test_concave_coverage_winding_and_translation},
     {"collinear_spike", test_collinear_spike},
     {"bowtie", test_bowtie},
     {"big_coord_sliver", test_big_coord_sliver},

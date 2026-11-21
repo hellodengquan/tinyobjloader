@@ -33,7 +33,9 @@
 #pragma GCC diagnostic pop
 #endif
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -4211,6 +4213,313 @@ void test_loadobjopt_mixed_line_endings() {
 
 #include "opt/loadobjopt_multithread.inc"
 
+// ---- Robust concave polygon triangulation regressions ----------------------
+//
+// The old triangulator picked two global axes and mixed absolute coordinates
+// into its orientation test, so translating a face could change (or
+// collapse) its triangulation. These tests pin the required behaviour:
+// exact coverage of the polygon, translation-invariant ring-local results,
+// identical output across the legacy / optimized (single- and multi-thread)
+// / streaming loaders, preserved per-corner attributes, and an explicit
+// warning instead of silently lost coverage on degenerate input.
+
+namespace {
+
+// Signed area of one triangle computed from edge vectors anchored at the
+// triangle's first vertex, so large world offsets do not cancel.
+template <typename AttribT>
+double EdgeRelativeTriArea(const AttribT &attrib,
+                           const tinyobj::index_t &i0,
+                           const tinyobj::index_t &i1,
+                           const tinyobj::index_t &i2) {
+  const double ax = attrib.vertices[3 * i0.vertex_index];
+  const double ay = attrib.vertices[3 * i0.vertex_index + 1];
+  const double bx = attrib.vertices[3 * i1.vertex_index];
+  const double by = attrib.vertices[3 * i1.vertex_index + 1];
+  const double cx = attrib.vertices[3 * i2.vertex_index];
+  const double cy = attrib.vertices[3 * i2.vertex_index + 1];
+  const double ux = bx - ax, uy = by - ay;
+  const double vx = cx - ax, vy = cy - ay;
+  return 0.5 * (ux * vy - uy * vx);
+}
+
+// Concave L-shaped hexagon (area 3), each corner carrying its own
+// position/texcoord/normal indices and a shared smoothing group. No mtllib is
+// referenced so a clean triangulation produces an empty warning string.
+std::string BuildConcaveObj(double tx, double ty) {
+  std::ostringstream os;
+  const double pts[6][2] = {{0, 0}, {2, 0}, {2, 1}, {1, 1}, {1, 2}, {0, 2}};
+  for (int i = 0; i < 6; i++) {
+    os << "v " << (tx + pts[i][0]) << " " << (ty + pts[i][1]) << " 0.0\n";
+  }
+  for (int i = 0; i < 6; i++) {
+    os << "vt " << (0.1 * i) << " " << (0.2 * i) << "\n";
+  }
+  for (int i = 0; i < 6; i++) {
+    os << "vn 0.0 0.0 1.0\n";
+  }
+  os << "s 42\n";
+  os << "f 1/1/1 2/2/2 3/3/3 4/4/4 5/5/5 6/6/6\n";
+  return os.str();
+}
+
+std::string LegacySignature(const std::string &obj, double *total_area,
+                            int *all_ccw, std::string *warn_out) {
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  std::istringstream iss(obj);
+  bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                             &iss, NULL, true);
+  TEST_CHECK(ok == true);
+  if (warn_out) *warn_out = warn;
+  std::ostringstream sig;
+  double area = 0.0;
+  int ccw = 1;
+  const size_t ntris = shapes[0].mesh.num_face_vertices.size();
+  for (size_t f = 0; f < ntris; f++) {
+    TEST_CHECK(shapes[0].mesh.num_face_vertices[f] == 3);
+    const tinyobj::index_t &i0 = shapes[0].mesh.indices[3 * f];
+    const tinyobj::index_t &i1 = shapes[0].mesh.indices[3 * f + 1];
+    const tinyobj::index_t &i2 = shapes[0].mesh.indices[3 * f + 2];
+    const double ta = EdgeRelativeTriArea(attrib, i0, i1, i2);
+    if (ta <= 0.0) ccw = 0;
+    area += ta;
+    sig << i0.vertex_index << "/" << i0.texcoord_index << "/"
+        << i0.normal_index << ";" << i1.vertex_index << "/"
+        << i1.texcoord_index << "/" << i1.normal_index << ";"
+        << i2.vertex_index << "/" << i2.texcoord_index << "/"
+        << i2.normal_index << "|";
+    // Every emitted corner must keep its original corner's triplet.
+    TEST_CHECK(i0.vertex_index == i0.texcoord_index &&
+               i0.texcoord_index == i0.normal_index);
+    TEST_CHECK(i1.vertex_index == i1.texcoord_index &&
+               i1.texcoord_index == i1.normal_index);
+    TEST_CHECK(i2.vertex_index == i2.texcoord_index &&
+               i2.texcoord_index == i2.normal_index);
+    TEST_CHECK(shapes[0].mesh.smoothing_group_ids[f] == 42);
+  }
+  if (total_area) *total_area = area;
+  if (all_ccw) *all_ccw = ccw;
+  return sig.str();
+}
+
+std::string OptSignature(const std::string &obj, int num_threads,
+                         double *total_area, int *all_ccw,
+                         std::string *warn_out) {
+  tinyobj::basic_attrib_t<> attrib;
+  std::vector<tinyobj::basic_shape_t<>> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  tinyobj::OptLoadConfig config;
+  config.triangulate = true;
+  config.num_threads = num_threads;
+  bool ok = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                obj.c_str(), obj.size(), config);
+  TEST_CHECK(ok == true);
+  if (warn_out) *warn_out = warn;
+  std::ostringstream sig;
+  double area = 0.0;
+  int ccw = 1;
+  const size_t ntris = attrib.face_num_verts.size();
+  for (size_t f = 0; f < ntris; f++) {
+    TEST_CHECK(attrib.face_num_verts[f] == 3);
+    const tinyobj::index_t &i0 = attrib.indices[3 * f];
+    const tinyobj::index_t &i1 = attrib.indices[3 * f + 1];
+    const tinyobj::index_t &i2 = attrib.indices[3 * f + 2];
+    const double ta = EdgeRelativeTriArea(attrib, i0, i1, i2);
+    if (ta <= 0.0) ccw = 0;
+    area += ta;
+    sig << i0.vertex_index << "/" << i0.texcoord_index << "/"
+        << i0.normal_index << ";" << i1.vertex_index << "/"
+        << i1.texcoord_index << "/" << i1.normal_index << ";"
+        << i2.vertex_index << "/" << i2.texcoord_index << "/"
+        << i2.normal_index << "|";
+  }
+  if (total_area) *total_area = area;
+  if (all_ccw) *all_ccw = ccw;
+  return sig.str();
+}
+
+class CollectingStreamHandler : public tinyobj::experimental_stream::StreamHandler {
+ public:
+  void OnVertex(tinyobj::real_t, tinyobj::real_t, tinyobj::real_t, bool,
+                tinyobj::real_t, bool, tinyobj::real_t, tinyobj::real_t,
+                tinyobj::real_t) override {}
+  void OnNormal(tinyobj::real_t, tinyobj::real_t, tinyobj::real_t) override {}
+  void OnTexcoord(tinyobj::real_t, tinyobj::real_t, bool,
+                  tinyobj::real_t) override {}
+  void OnGroup(const std::string &) override {}
+  void OnObject(const std::string &) override {}
+  void OnUsemtl(const std::string &) override {}
+  void OnMtllib(const std::vector<std::string> &) override {}
+  void OnSmoothingGroup(unsigned int) override {}
+  void OnFace(const tinyobj::index_t *indices, size_t num_indices) override {
+    TEST_CHECK(num_indices == 3);
+    for (size_t k = 0; k < num_indices; k++) faces.push_back(indices[k]);
+  }
+  std::vector<tinyobj::index_t> faces;
+};
+
+std::string StreamSignature(const std::string &obj,
+                            std::string *warn_out) {
+  tinyobj::experimental_stream::StreamLoadConfig config;
+  config.triangulate = true;
+  CollectingStreamHandler handler;
+  std::istringstream iss(obj);
+  std::string warn, err;
+  bool ok = tinyobj::experimental_stream::ParseObjStream(
+      &iss, &handler, &warn, &err, "mem", config);
+  TEST_CHECK(ok == true);
+  if (warn_out) *warn_out = warn;
+  std::ostringstream sig;
+  for (size_t f = 0; f < handler.faces.size() / 3; f++) {
+    const tinyobj::index_t &i0 = handler.faces[3 * f];
+    const tinyobj::index_t &i1 = handler.faces[3 * f + 1];
+    const tinyobj::index_t &i2 = handler.faces[3 * f + 2];
+    sig << i0.vertex_index << "/" << i0.texcoord_index << "/"
+        << i0.normal_index << ";" << i1.vertex_index << "/"
+        << i1.texcoord_index << "/" << i1.normal_index << ";"
+        << i2.vertex_index << "/" << i2.texcoord_index << "/"
+        << i2.normal_index << "|";
+  }
+  return sig.str();
+}
+
+}  // namespace
+
+// Concave polygon: exact, correctly-wound coverage with n-2 triangles.
+void test_triangulation_concave_covers_polygon() {
+  const std::string obj = BuildConcaveObj(0.0, 0.0);
+  double area = 0.0;
+  int all_ccw = 0;
+  const std::string sig = LegacySignature(obj, &area, &all_ccw, NULL);
+  TEST_CHECK_(area == 3.0, "area %.15f", area);
+  TEST_CHECK(all_ccw == 1);  // CCW input ring -> CCW triangles
+  // Hexagon -> exactly 4 triangles.
+  TEST_CHECK(std::count(sig.begin(), sig.end(), '|') == 4);
+}
+
+// Translating the same face must not change the ring-local triangulation,
+// and every loader (legacy / opt single-thread / opt multi-thread / stream)
+// must produce the same triangles.
+void test_triangulation_translation_invariant_and_loader_consistent() {
+  const double offsets[][2] = {{0.0, 0.0},
+                               {100.0, 200.0},
+                               {10000.0, -5000.0},
+                               {100000.0, 300000.0},
+                               {-70000.0, 90000.0}};
+  const std::string base_obj = BuildConcaveObj(0.0, 0.0);
+  double base_area = 0.0;
+  int base_ccw = 0;
+  std::string base_warn;
+  const std::string base =
+      LegacySignature(base_obj, &base_area, &base_ccw, &base_warn);
+  TEST_CHECK(base_warn.empty());
+  TEST_CHECK(base_area == 3.0);
+
+  for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+    const std::string obj = BuildConcaveObj(offsets[i][0], offsets[i][1]);
+
+    double area = 0.0;
+    int ccw = 0;
+    std::string warn;
+    TEST_CHECK(LegacySignature(obj, &area, &ccw, &warn) == base);
+    TEST_CHECK(area == 3.0);
+    TEST_CHECK(ccw == 1);
+    TEST_CHECK(warn.empty());
+
+    TEST_CHECK(OptSignature(obj, 1, &area, &ccw, &warn) == base);
+    TEST_CHECK(area == 3.0);
+    TEST_CHECK(ccw == 1);
+    TEST_CHECK(warn.empty());
+
+    TEST_CHECK(OptSignature(obj, 4, &area, &ccw, &warn) == base);
+    TEST_CHECK(area == 3.0);
+    TEST_CHECK(ccw == 1);
+    TEST_CHECK(warn.empty());
+
+    TEST_CHECK(StreamSignature(obj, &warn) == base);
+    TEST_CHECK(warn.empty());
+  }
+}
+
+// Convex polygon keeps the clean fan fast path and emits no warning.
+void test_triangulation_convex_fan_quality() {
+  std::ostringstream os;
+  const int n = 7;
+  for (int i = 0; i < n; i++) {
+    const double a = 2.0 * 3.14159265358979323846 * i / n;
+    os << "v " << (3.0 * std::cos(a)) << " " << (3.0 * std::sin(a))
+       << " 0.0\n";
+  }
+  os << "f 1 2 3 4 5 6 7\n";
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  std::istringstream iss(os.str());
+  bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                             &iss, NULL, true);
+  TEST_CHECK(ok == true);
+  TEST_CHECK(warn.empty());
+  TEST_CHECK(shapes[0].mesh.num_face_vertices.size() ==
+            static_cast<size_t>(n - 2));
+  // Fan: every triangle starts at corner 0.
+  for (size_t f = 0; f < shapes[0].mesh.num_face_vertices.size(); f++) {
+    TEST_CHECK(shapes[0].mesh.indices[3 * f].vertex_index == 0);
+  }
+}
+
+// Degenerate (fully collinear) face still yields n-2 triangles and must warn
+// rather than silently dropping coverage.
+void test_triangulation_degenerate_warns_but_keeps_count() {
+  const char *obj_text =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 1.0 1.0\n"
+      "v 2.0 2.0 2.0\n"
+      "v 3.0 3.0 3.0\n"
+      "v 4.0 4.0 4.0\n"
+      "f 1 2 3 4 5\n";
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  std::istringstream iss(obj_text);
+  bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                             &iss, NULL, true);
+  TEST_CHECK(ok == true);
+  TEST_CHECK(!warn.empty());  // explicit best-effort warning
+  TEST_CHECK(shapes[0].mesh.num_face_vertices.size() == 3);  // n-2 kept
+  TEST_CHECK(shapes[0].mesh.indices.size() == 9);
+}
+
+// A face that cannot be triangulated (out-of-range corner) must produce a
+// warning instead of silently losing coverage. The OBJ text parser maps an
+// unparseable float token to 0, so non-finite coordinates cannot survive
+// parsing; the reachable rejection path is an invalid vertex index.
+void test_triangulation_nonfinite_face_warns() {
+  const char *obj_text =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 1.0 1.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "f 1 2 3 999\n";
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  std::istringstream iss(obj_text);
+  bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                             &iss, NULL, true);
+  TEST_CHECK(ok == true);
+  TEST_CHECK(!warn.empty());
+  // The invalid face contributes no triangles.
+  TEST_CHECK(shapes[0].mesh.indices.size() == 0);
+}
+
 TEST_LIST = {
     {"cornell_box", test_cornell_box},
     {"catmark_torus_creases0", test_catmark_torus_creases0},
@@ -4505,4 +4814,14 @@ TEST_LIST = {
      test_loadobjopt_object_name_trimming},
     {"test_loadobjopt_mixed_line_endings",
      test_loadobjopt_mixed_line_endings},
+    {"test_triangulation_concave_covers_polygon",
+     test_triangulation_concave_covers_polygon},
+    {"test_triangulation_translation_invariant_and_loader_consistent",
+     test_triangulation_translation_invariant_and_loader_consistent},
+    {"test_triangulation_convex_fan_quality",
+     test_triangulation_convex_fan_quality},
+    {"test_triangulation_degenerate_warns_but_keeps_count",
+     test_triangulation_degenerate_warns_but_keeps_count},
+    {"test_triangulation_nonfinite_face_warns",
+     test_triangulation_nonfinite_face_warns},
     {NULL, NULL}};

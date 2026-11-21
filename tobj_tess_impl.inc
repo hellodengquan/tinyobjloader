@@ -10,17 +10,24 @@ static int TOBJ_TESS_T(tobj_tess_project)(const TOBJ_TESS_REAL *pts, uint32_t n,
                                           const TOBJ_TESS_REAL *given_normal,
                                           uint32_t flags, tobj_tess_work *w) {
   double cx = (double)pts[0], cy = (double)pts[1], cz = (double)pts[2];
-  double coordmax = 0.0;
-  for (uint32_t i = 0; i < 3u * n; i++) {
-    double a = tobj_dabs((double)pts[i]);
-    if (a > coordmax) coordmax = a;
-  }
+
+  /* Edge-length scale (squared), from coordinate differences only, so the
+   * degeneracy test is independent of the ring's position in space. */
+  double edge_scale2 = 0.0;
 
   double nx = 0, ny = 0, nz = 0;
   if (flags & TOBJ_TESS_FLAG_NORMAL_GIVEN) {
     nx = (double)given_normal[0];
     ny = (double)given_normal[1];
     nz = (double)given_normal[2];
+    for (uint32_t k = 0; k < n; k++) {
+      uint32_t j = (k + 1u) % n;
+      double ex = (double)pts[3 * j] - (double)pts[3 * k];
+      double ey = (double)pts[3 * j + 1] - (double)pts[3 * k + 1];
+      double ez = (double)pts[3 * j + 2] - (double)pts[3 * k + 2];
+      double e2 = ex * ex + ey * ey + ez * ez;
+      if (e2 > edge_scale2) edge_scale2 = e2;
+    }
   } else {
     for (uint32_t k = 0; k < n; k++) {
       uint32_t j = (k + 1u) % n;
@@ -31,11 +38,14 @@ static int TOBJ_TESS_T(tobj_tess_project)(const TOBJ_TESS_REAL *pts, uint32_t n,
       nx += (ay - by) * (az + bz);
       ny += (az - bz) * (ax + bx);
       nz += (ax - bx) * (ay + by);
+      double ex = ax - bx, ey = ay - by, ez = az - bz;
+      double e2 = ex * ex + ey * ey + ez * ez;
+      if (e2 > edge_scale2) edge_scale2 = e2;
     }
   }
   double len2 = nx * nx + ny * ny + nz * nz;
-  double cm2 = coordmax * coordmax;
-  double thresh = cm2 * cm2 * TOBJ_TESS_REL_N;
+  /* |Newell normal| scales like edge^2; compare against edge^4 * eps. */
+  double thresh = edge_scale2 * edge_scale2 * TOBJ_TESS_REL_N;
 
   if (tobj_is_finite(len2) && len2 > thresh && len2 > 0.0) {
     /* in-plane basis (unnormalized: only orientation signs matter) */
